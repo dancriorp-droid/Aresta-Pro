@@ -7,9 +7,12 @@ try:
     import pyotp
 except:
     pass
-# Selenium removido — usando requests + BeautifulSoup (mais rápido)
-import requests
-from bs4 import BeautifulSoup
+from selenium import webdriver
+from selenium.webdriver.chrome.service import Service as ChromeService
+from selenium.webdriver.chrome.options import Options as ChromeOptions
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
 import pandas as pd
 import os, re, io, calendar, time, base64
 import plotly.express as px
@@ -329,114 +332,88 @@ def gerar_excel_formatado(tabela_final, sua_col, sheet_name='Monitoramento'):
 
 
 # ==============================================================================
-# FUNÇÕES DE BUSCA — via requests (sem Selenium, muito mais rápido)
+# FUNÇÕES DE BUSCA — Selenium otimizado para cloud
 # ==============================================================================
-import concurrent.futures
 
-HEADERS_BOOKING = {
-    "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    "Accept-Language": "pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "Accept-Encoding": "gzip, deflate, br",
-    "Referer": "https://www.booking.com/",
-    "DNT": "1",
-}
+def _criar_driver_cloud():
+    """Cria driver Chromium headless otimizado para Streamlit Cloud."""
+    import os
+    options = ChromeOptions()
+    options.add_argument("--headless=new")
+    options.add_argument("--no-sandbox")
+    options.add_argument("--disable-dev-shm-usage")
+    options.add_argument("--disable-gpu")
+    options.add_argument("--disable-extensions")
+    options.add_argument("--disable-blink-features=AutomationControlled")
+    options.add_argument("--blink-settings=imagesEnabled=false")
+    options.add_argument("--window-size=1920,1080")
+    options.add_argument("--disable-software-rasterizer")
+    options.add_argument("--disable-background-timer-throttling")
+    options.add_argument("--disable-backgrounding-occluded-windows")
+    options.add_argument("--disable-renderer-backgrounding")
+    options.add_argument("--disable-infobars")
+    options.add_argument("--disable-notifications")
+    options.add_argument("--disable-popup-blocking")
+    options.add_argument("user-agent=Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+    
+    # Desabilita carregamento de CSS e fontes para acelerar
+    prefs = {
+        "profile.managed_default_content_settings.stylesheets": 2,
+        "profile.managed_default_content_settings.fonts": 2,
+    }
+    options.add_experimental_option("prefs", prefs)
+    
+    chrome_paths = ["/usr/bin/chromium", "/usr/bin/chromium-browser", "/usr/bin/google-chrome", "/usr/bin/google-chrome-stable"]
+    driver_paths = ["/usr/bin/chromedriver", "/usr/lib/chromium-browser/chromedriver", "/usr/lib/chromium/chromedriver"]
+    
+    for p in chrome_paths:
+        if os.path.exists(p):
+            options.binary_location = p
+            break
+    
+    service = None
+    for p in driver_paths:
+        if os.path.exists(p):
+            service = ChromeService(executable_path=p)
+            break
+    
+    if service is None:
+        service = ChromeService()
+    
+    driver = webdriver.Chrome(service=service, options=options)
+    driver.set_page_load_timeout(20)
+    return driver
 
-def _buscar_preco_booking_requests(hotel_nome, d_in, d_out, slug=None):
-    """
-    Busca preço de um hotel no Booking.com via requests + BeautifulSoup.
-    Retorna o preço (int) ou "Esgotado".
-    """
+
+def _extrair_preco_pagina(driver, wait, usa_slug=False):
+    """Extrai preço da página atual do Booking. Retorna int ou 'Esgotado'."""
     try:
-        session = requests.Session()
-        session.headers.update(HEADERS_BOOKING)
-        
-        if slug:
-            url = (f"https://www.booking.com/hotel/br/{slug}.pt-br.html"
-                   f"?checkin={d_in.isoformat()}&checkout={d_out.isoformat()}"
-                   f"&group_adults=2&no_rooms=1&selected_currency=BRL")
+        if usa_slug:
+            # Página direta do hotel — busca menor preço na tabela de quartos
+            wait.until(EC.presence_of_element_located((By.CSS_SELECTOR,
+                'tr.js-rt-block-row, [data-testid="price-and-discounted-price"], .prco-valign-middle-helper')))
+            time.sleep(1)
+            melhor = None
+            for el in driver.find_elements(By.CSS_SELECTOR,
+                    '.prco-valign-middle-helper, [data-testid="price-and-discounted-price"]'):
+                nums = re.findall(r'\d+', el.text.replace('.', '').replace(',', ''))
+                if nums:
+                    v = int(nums[-1])
+                    if v > 50 and (melhor is None or v < melhor):
+                        melhor = v
+            return melhor if melhor else "Esgotado"
         else:
-            url = (f"https://www.booking.com/searchresults.pt-br.html"
-                   f"?ss={hotel_nome.replace(' ', '+')}"
-                   f"&checkin={d_in.isoformat()}&checkout={d_out.isoformat()}"
-                   f"&group_adults=2&no_rooms=1&selected_currency=BRL&lang=pt-br")
-        
-        resp = session.get(url, timeout=15)
-        resp.raise_for_status()
-        soup = BeautifulSoup(resp.text, "html.parser")
-        
-        # Tenta encontrar preço em páginas de hotel direto
-        if slug:
-            # Busca na tabela de quartos
-            precos = []
-            for el in soup.select('[data-testid="price-and-discounted-price"], .prco-valign-middle-helper, [class*="priceValue"]'):
-                nums = re.findall(r'\d+', el.get_text().replace('.', '').replace(',', ''))
-                if nums:
-                    precos.append(int(nums[-1]))
-            if precos:
-                return min(precos)  # menor preço
-        
-        # Busca em resultados de pesquisa
-        for el in soup.select('[data-testid="price-and-discounted-price"], .prco-valign-middle-helper, [class*="price"]'):
-            texto = el.get_text()
-            nums = re.findall(r'\d+', texto.replace('.', '').replace(',', ''))
-            if nums:
-                val = int(nums[-1])
-                if val > 50:  # ignora valores muito baixos (notas, etc)
-                    return val
-        
-        return "Esgotado"
-    except Exception as e:
-        return "Esgotado"
-
-
-def _buscar_quartos_booking_requests(slug, d_in, d_out, n=5):
-    """
-    Busca quartos e preços de um hotel específico via requests.
-    Retorna lista de dicts: [{"nome": str, "preco": int|str}]
-    """
-    try:
-        session = requests.Session()
-        session.headers.update(HEADERS_BOOKING)
-        
-        url = (f"https://www.booking.com/hotel/br/{slug}.pt-br.html"
-               f"?checkin={d_in.isoformat()}&checkout={d_out.isoformat()}"
-               f"&group_adults=2&no_rooms=1&selected_currency=BRL&lang=pt-br")
-        
-        resp = session.get(url, timeout=15)
-        resp.raise_for_status()
-        soup = BeautifulSoup(resp.text, "html.parser")
-        
-        quartos = []
-        nomes_vistos = set()
-        
-        # Tenta pegar da tabela de quartos
-        for row in soup.select("tr.js-rt-block-row, [data-testid='property-card']"):
-            nome_el = row.select_one("span.hprt-roomtype-icon-link, a.hprt-roomtype-link, [data-testid='title']")
-            if not nome_el:
-                continue
-            nome = " ".join(nome_el.get_text().strip().split())
-            if not nome or nome.lower() in nomes_vistos:
-                continue
-            
-            preco = "Esgotado"
-            for price_el in row.select(".prco-valign-middle-helper, [data-testid='price-and-discounted-price'], [class*='priceValue']"):
-                nums = re.findall(r'\d+', price_el.get_text().replace('.', '').replace(',', ''))
-                if nums:
-                    preco = int(nums[-1])
-                    break
-            
-            nomes_vistos.add(nome.lower())
-            quartos.append({"nome": nome, "preco": preco})
-            if len(quartos) >= n:
-                break
-        
-        return quartos[:n]
+            # Resultado de busca por nome
+            wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, '[data-testid="property-card"]')))
+            card = driver.find_element(By.CSS_SELECTOR, '[data-testid="property-card"]')
+            preco_elem = card.find_element(By.CSS_SELECTOR, '[data-testid="price-and-discounted-price"]')
+            valor = re.findall(r'\d+', preco_elem.text.replace('.', '').replace(',', ''))
+            return int(valor[-1]) if valor else "Esgotado"
     except:
-        return []
+        return "Esgotado"
 
 
-# --- FUNÇÃO: Executa varredura por nome (requests) ---
+# --- FUNÇÃO: Executa varredura por nome ---
 def executar_varredura(datas_para_busca, concorrentes, url_base_busca=None):
     todas_buscas = []
     status = st.empty()
@@ -444,13 +421,24 @@ def executar_varredura(datas_para_busca, concorrentes, url_base_busca=None):
     total = len(datas_para_busca) * len(concorrentes)
     cont = 0
 
-    for d_in, d_out in datas_para_busca:
-        for hotel in concorrentes:
-            status.markdown(f"📡 Pesquisando: **{d_in.strftime('%d/%m')}** | {hotel}")
-            preco_final = _buscar_preco_booking_requests(hotel, d_in, d_out)
-            todas_buscas.append({"Data": d_in.strftime("%d/%m/%Y"), "Hotel": hotel, "Preço": preco_final})
-            cont += 1
-            prog.progress(cont / total)
+    status.markdown("🚀 Iniciando navegador...")
+    driver = _criar_driver_cloud()
+    wait = WebDriverWait(driver, 8)
+
+    try:
+        for d_in, d_out in datas_para_busca:
+            for hotel in concorrentes:
+                status.markdown(f"📡 Pesquisando: **{d_in.strftime('%d/%m')}** | {hotel}")
+                url = (f"https://www.booking.com/searchresults.pt-br.html?ss={hotel.replace(' ', '+')}"
+                       f"&checkin={d_in.isoformat()}&checkout={d_out.isoformat()}"
+                       f"&group_adults=2&no_rooms=1&selected_currency=BRL&lang=pt-br")
+                driver.get(url)
+                preco_final = _extrair_preco_pagina(driver, wait, usa_slug=False)
+                todas_buscas.append({"Data": d_in.strftime("%d/%m/%Y"), "Hotel": hotel, "Preço": preco_final})
+                cont += 1
+                prog.progress(cont / total)
+    finally:
+        driver.quit()
 
     status.success("✅ Varredura concluída!")
     df_resultado = pd.DataFrame(todas_buscas)
@@ -466,7 +454,7 @@ def executar_varredura(datas_para_busca, concorrentes, url_base_busca=None):
     return df_resultado
 
 
-# --- FUNÇÃO: Executa varredura por URL direta / slug (requests) ---
+# --- FUNÇÃO: Executa varredura por URL direta / slug ---
 def executar_varredura_por_url(datas_para_busca, slugs):
     todas_buscas = []
     status = st.empty()
@@ -474,13 +462,24 @@ def executar_varredura_por_url(datas_para_busca, slugs):
     total = len(datas_para_busca) * len(slugs)
     cont = 0
 
-    for d_in, d_out in datas_para_busca:
-        for nome, slug in slugs.items():
-            status.markdown(f"📡 Pesquisando: **{d_in.strftime('%d/%m')}** | {nome}")
-            preco_final = _buscar_preco_booking_requests(nome, d_in, d_out, slug=slug)
-            todas_buscas.append({"Data": d_in.strftime("%d/%m/%Y"), "Hotel": nome, "Preço": preco_final})
-            cont += 1
-            prog.progress(cont / total)
+    status.markdown("🚀 Iniciando navegador...")
+    driver = _criar_driver_cloud()
+    wait = WebDriverWait(driver, 8)
+
+    try:
+        for d_in, d_out in datas_para_busca:
+            for nome, slug in slugs.items():
+                status.markdown(f"📡 Pesquisando: **{d_in.strftime('%d/%m')}** | {nome}")
+                url = (f"https://www.booking.com/hotel/br/{slug}.pt-br.html"
+                       f"?checkin={d_in.isoformat()}&checkout={d_out.isoformat()}"
+                       f"&group_adults=2&no_rooms=1&selected_currency=BRL")
+                driver.get(url)
+                preco_final = _extrair_preco_pagina(driver, wait, usa_slug=True)
+                todas_buscas.append({"Data": d_in.strftime("%d/%m/%Y"), "Hotel": nome, "Preço": preco_final})
+                cont += 1
+                prog.progress(cont / total)
+    finally:
+        driver.quit()
 
     status.success("✅ Varredura concluída!")
     df_resultado = pd.DataFrame(todas_buscas)
@@ -729,8 +728,56 @@ def _shopper_selecionar_datas(key_prefix):
 # ==============================================================================
 
 # ==============================================================================
-# SHOPPER ALTO DA BOA VISTA — funções especiais (quartos + nome) via requests
+# SHOPPER ALTO DA BOA VISTA — funções especiais (quartos + nome) via Selenium
 # ==============================================================================
+
+def _buscar_quartos_hotel_booking(driver, wait, url_hotel, n=5):
+    """Busca quartos e preços de um hotel específico."""
+    quartos = []
+    nomes_vistos = set()
+    precos_vistos = set()
+    try:
+        driver.get(url_hotel)
+        wait.until(EC.presence_of_element_located((By.CSS_SELECTOR,
+            'tr.js-rt-block-row, [data-testid="price-and-discounted-price"]')))
+        time.sleep(1.5)
+        for linha in driver.find_elements(By.CSS_SELECTOR, 'tr.js-rt-block-row'):
+            if len(quartos) >= n:
+                break
+            nome = ""
+            try:
+                nome = " ".join(linha.find_element(By.CSS_SELECTOR,
+                    'span.hprt-roomtype-icon-link').text.strip().split())
+            except:
+                continue
+            if not nome or nome.lower() in nomes_vistos:
+                continue
+            preco = "Esgotado"
+            try:
+                el = linha.find_element(By.CSS_SELECTOR,
+                    'div.bui-price-display__value span.prco-valign-middle-helper')
+                nums = re.findall(r'\d+', el.text.strip().replace('.', '').replace(',', ''))
+                if nums:
+                    preco = int(nums[-1])
+            except:
+                try:
+                    opt = linha.find_element(By.CSS_SELECTOR,
+                        'select.hprt-nos-select option[value="1"]')
+                    nums = re.findall(r'\d+', opt.text.replace('.', '').replace(',', ''))
+                    if nums:
+                        preco = int(nums[-1])
+                except:
+                    pass
+            if isinstance(preco, int) and preco in precos_vistos:
+                continue
+            nomes_vistos.add(nome.lower())
+            if isinstance(preco, int):
+                precos_vistos.add(preco)
+            quartos.append({"nome": nome, "preco": preco})
+    except:
+        pass
+    return quartos[:n]
+
 
 def executar_varredura_alto(datas_para_busca, concorrentes, sua_col, slug_alto):
     SLUGS_CONC = {
@@ -748,33 +795,60 @@ def executar_varredura_alto(datas_para_busca, concorrentes, sua_col, slug_alto):
     total  = len(datas_para_busca) * (len(outros) + 1)
     cont   = 0
     todas  = []
-    
-    for d_in, d_out in datas_para_busca:
-        label = f"{d_in.strftime('%d/%m/%Y')} → {d_out.strftime('%d/%m/%Y')}"
-        linha = {"Data": label}
-        
-        for hotel in outros:
-            status.markdown(f"📡 **{label}** | {hotel[:35]}...")
-            slug = SLUGS_CONC.get(hotel, "")
-            preco = _buscar_preco_booking_requests(hotel, d_in, d_out, slug=slug if slug else None)
-            linha[hotel] = preco
-            linha[f"{hotel}__quarto"] = ""  # requests não pega nome do quarto dos concorrentes
+
+    status.markdown("🚀 Iniciando navegador...")
+    driver = _criar_driver_cloud()
+    wait   = WebDriverWait(driver, 10)
+
+    try:
+        for d_in, d_out in datas_para_busca:
+            label = f"{d_in.strftime('%d/%m/%Y')} → {d_out.strftime('%d/%m/%Y')}"
+            linha = {"Data": label}
+
+            for hotel in outros:
+                status.markdown(f"📡 **{label}** | {hotel[:35]}...")
+                slug = SLUGS_CONC.get(hotel, "")
+                if slug:
+                    url = (f"https://www.booking.com/hotel/br/{slug}.pt-br.html"
+                           f"?checkin={d_in.isoformat()}&checkout={d_out.isoformat()}"
+                           f"&group_adults=2&no_rooms=1&selected_currency=BRL")
+                else:
+                    url = (f"https://www.booking.com/searchresults.pt-br.html"
+                           f"?ss={hotel.replace(' ', '+')}"
+                           f"&checkin={d_in.isoformat()}&checkout={d_out.isoformat()}"
+                           f"&group_adults=2&no_rooms=1&selected_currency=BRL&lang=pt-br")
+                driver.get(url)
+                preco = _extrair_preco_pagina(driver, wait, usa_slug=bool(slug))
+                nome_conc = ""
+                if slug:
+                    try:
+                        nome_conc = " ".join(driver.find_element(By.CSS_SELECTOR,
+                            'span.hprt-roomtype-icon-link').text.strip().split())
+                    except:
+                        pass
+                linha[hotel] = preco
+                linha[f"{hotel}__quarto"] = nome_conc
+                cont += 1
+                prog.progress(cont / total)
+
+            # Busca quartos do Alto da Boa Vista
+            status.markdown(f"🏨 **{label}** | Alto da Boa Vista — buscando quartos...")
+            url_alto = (f"https://www.booking.com/hotel/br/{slug_alto}.pt-br.html"
+                        f"?checkin={d_in.isoformat()}&checkout={d_out.isoformat()}"
+                        f"&group_adults=2&no_rooms=1&selected_currency=BRL&lang=pt-br")
+            quartos = _buscar_quartos_hotel_booking(driver, wait, url_alto, n=5)
+            for i, q in enumerate(quartos):
+                linha[f"Alto_Q{i+1}_nome"]  = q["nome"]
+                linha[f"Alto_Q{i+1}_preco"] = q["preco"]
+            for i in range(len(quartos), 5):
+                linha[f"Alto_Q{i+1}_nome"]  = "Esgotado"
+                linha[f"Alto_Q{i+1}_preco"] = "Esgotado"
             cont += 1
             prog.progress(cont / total)
-        
-        # Busca quartos do Alto da Boa Vista
-        status.markdown(f"🏨 **{label}** | Alto da Boa Vista — buscando quartos...")
-        quartos = _buscar_quartos_booking_requests(slug_alto, d_in, d_out, n=5)
-        for i, q in enumerate(quartos):
-            linha[f"Alto_Q{i+1}_nome"]  = q["nome"]
-            linha[f"Alto_Q{i+1}_preco"] = q["preco"]
-        for i in range(len(quartos), 5):
-            linha[f"Alto_Q{i+1}_nome"]  = "Esgotado"
-            linha[f"Alto_Q{i+1}_preco"] = "Esgotado"
-        cont += 1
-        prog.progress(cont / total)
-        todas.append(linha)
-    
+            todas.append(linha)
+    finally:
+        driver.quit()
+
     status.success("✅ Varredura concluída!")
     df = pd.DataFrame(todas)
     historico_salvar(funcao="Shopper Alto da Boa Vista",
