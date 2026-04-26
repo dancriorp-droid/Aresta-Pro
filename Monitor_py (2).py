@@ -7,7 +7,13 @@ try:
     import pyotp
 except:
     pass
-import requests
+from playwright.sync_api import sync_playwright
+import subprocess
+# Instala o navegador Chromium do Playwright na primeira execução
+try:
+    subprocess.run(["playwright", "install", "chromium"], capture_output=True, timeout=120)
+except:
+    pass
 import pandas as pd
 import os, re, io, calendar, time, base64
 import plotly.express as px
@@ -327,155 +333,88 @@ def gerar_excel_formatado(tabela_final, sua_col, sheet_name='Monitoramento'):
 
 
 # ==============================================================================
-# FUNÇÕES DE BUSCA — via Booking.com Demand API (rápido e confiável)
+# FUNÇÕES DE BUSCA — Playwright (mais rápido que Selenium)
 # ==============================================================================
 
-BOOKING_API_KEY = "a4c0977d-5ddb-46ea-97b2-2b0e1c3e7a75"
-BOOKING_AFFILIATE_ID = "2871199"
-BOOKING_API_BASE = "https://demandapi.booking.com/3.1"
-
-def _booking_api_headers():
-    """Retorna headers de autenticação para a Demand API."""
-    return {
-        "Authorization": f"Bearer {BOOKING_API_KEY}",
-        "Content-Type": "application/json",
-        "X-Affiliate-Id": BOOKING_AFFILIATE_ID,
-    }
-
-@st.cache_data(ttl=86400)
-def _buscar_hotel_id_por_nome(nome_hotel):
-    """
-    Busca o accommodation ID do Booking.com pelo nome do hotel.
-    Usa cache de 24h para não repetir buscas.
-    """
+def _buscar_preco_playwright(page, hotel_nome, d_in, d_out, slug=None):
+    """Busca preço de um hotel. Retorna int ou 'Esgotado'."""
     try:
-        resp = requests.post(
-            f"{BOOKING_API_BASE}/accommodations/search",
-            headers=_booking_api_headers(),
-            json={
-                "booker": {"country": "br", "platform": "desktop"},
-                "checkin": (date.today() + timedelta(days=30)).isoformat(),
-                "checkout": (date.today() + timedelta(days=31)).isoformat(),
-                "guests": {"number_of_adults": 2, "number_of_rooms": 1},
-                "extras": ["products"],
-                "name": nome_hotel,
-                "rows": 5,
-            },
-            timeout=15,
-        )
-        resp.raise_for_status()
-        data = resp.json()
-        results = data.get("data", [])
-        if results:
-            # Retorna o primeiro resultado (melhor match)
-            return results[0].get("id")
-    except Exception as e:
-        st.warning(f"⚠️ Erro ao buscar ID de '{nome_hotel}': {e}")
-    return None
+        if slug:
+            url = (f"https://www.booking.com/hotel/br/{slug}.pt-br.html"
+                   f"?checkin={d_in.isoformat()}&checkout={d_out.isoformat()}"
+                   f"&group_adults=2&no_rooms=1&selected_currency=BRL")
+        else:
+            url = (f"https://www.booking.com/searchresults.pt-br.html"
+                   f"?ss={hotel_nome.replace(' ', '+')}"
+                   f"&checkin={d_in.isoformat()}&checkout={d_out.isoformat()}"
+                   f"&group_adults=2&no_rooms=1&selected_currency=BRL&lang=pt-br")
+        
+        page.goto(url, wait_until="domcontentloaded", timeout=15000)
+        
+        if slug:
+            # Página direta do hotel
+            page.wait_for_selector('.prco-valign-middle-helper, [data-testid="price-and-discounted-price"]', timeout=8000)
+            time.sleep(0.5)
+            elements = page.query_selector_all('.prco-valign-middle-helper, [data-testid="price-and-discounted-price"]')
+            melhor = None
+            for el in elements:
+                texto = el.inner_text()
+                nums = re.findall(r'\d+', texto.replace('.', '').replace(',', ''))
+                if nums:
+                    v = int(nums[-1])
+                    if v > 50 and (melhor is None or v < melhor):
+                        melhor = v
+            return melhor if melhor else "Esgotado"
+        else:
+            # Resultados de busca
+            page.wait_for_selector('[data-testid="property-card"]', timeout=8000)
+            card = page.query_selector('[data-testid="property-card"]')
+            if card:
+                preco_el = card.query_selector('[data-testid="price-and-discounted-price"]')
+                if preco_el:
+                    valor = re.findall(r'\d+', preco_el.inner_text().replace('.', '').replace(',', ''))
+                    return int(valor[-1]) if valor else "Esgotado"
+            return "Esgotado"
+    except:
+        return "Esgotado"
 
 
-def _buscar_disponibilidade_api(accommodation_id, d_in, d_out):
-    """
-    Busca disponibilidade e preço via Demand API.
-    Retorna dict com preço e info do quarto, ou None.
-    """
+def _buscar_quartos_playwright(page, slug, d_in, d_out, n=5):
+    """Busca quartos e preços de um hotel. Retorna lista de dicts."""
+    quartos = []
+    nomes_vistos = set()
     try:
-        resp = requests.post(
-            f"{BOOKING_API_BASE}/accommodations/availability",
-            headers=_booking_api_headers(),
-            json={
-                "accommodation": accommodation_id,
-                "booker": {"country": "br", "platform": "desktop"},
-                "checkin": d_in.isoformat(),
-                "checkout": d_out.isoformat(),
-                "guests": {"number_of_adults": 2, "number_of_rooms": 1},
-                "extras": ["extra_charges"],
-                "currency": "BRL",
-            },
-            timeout=15,
-        )
-        resp.raise_for_status()
-        data = resp.json().get("data", {})
+        url = (f"https://www.booking.com/hotel/br/{slug}.pt-br.html"
+               f"?checkin={d_in.isoformat()}&checkout={d_out.isoformat()}"
+               f"&group_adults=2&no_rooms=1&selected_currency=BRL&lang=pt-br")
+        page.goto(url, wait_until="domcontentloaded", timeout=15000)
+        page.wait_for_selector('tr.js-rt-block-row', timeout=8000)
+        time.sleep(1)
         
-        products = data.get("products", [])
-        if not products:
-            return None
-        
-        # Pega a recomendação (melhor preço) ou o primeiro produto
-        recommendation = data.get("recommendation", {})
-        
-        melhor_preco = None
-        melhor_nome = ""
-        
-        for product in products:
-            preco_info = product.get("price", {})
-            preco = preco_info.get("book", preco_info.get("total"))
-            nome_quarto = product.get("room_name", product.get("name", ""))
-            
-            if preco is not None:
-                preco_val = float(preco)
-                if melhor_preco is None or preco_val < melhor_preco:
-                    melhor_preco = preco_val
-                    melhor_nome = nome_quarto
-        
-        if melhor_preco:
-            return {"preco": int(melhor_preco), "quarto": melhor_nome}
-        return None
-        
-    except Exception:
-        return None
-
-
-def _buscar_quartos_api(accommodation_id, d_in, d_out, n=5):
-    """
-    Busca todos os quartos e preços de um hotel via API.
-    Retorna lista de dicts: [{"nome": str, "preco": int|str}]
-    """
-    try:
-        resp = requests.post(
-            f"{BOOKING_API_BASE}/accommodations/availability",
-            headers=_booking_api_headers(),
-            json={
-                "accommodation": accommodation_id,
-                "booker": {"country": "br", "platform": "desktop"},
-                "checkin": d_in.isoformat(),
-                "checkout": d_out.isoformat(),
-                "guests": {"number_of_adults": 2, "number_of_rooms": 1},
-                "extras": ["extra_charges"],
-                "currency": "BRL",
-            },
-            timeout=15,
-        )
-        resp.raise_for_status()
-        data = resp.json().get("data", {})
-        products = data.get("products", [])
-        
-        quartos = []
-        nomes_vistos = set()
-        
-        for product in products:
-            nome = product.get("room_name", product.get("name", ""))
+        for row in page.query_selector_all('tr.js-rt-block-row'):
+            if len(quartos) >= n:
+                break
+            nome_el = row.query_selector('span.hprt-roomtype-icon-link')
+            if not nome_el:
+                continue
+            nome = " ".join(nome_el.inner_text().strip().split())
             if not nome or nome.lower() in nomes_vistos:
                 continue
             
-            preco_info = product.get("price", {})
-            preco = preco_info.get("book", preco_info.get("total"))
-            
-            if preco is not None:
-                quartos.append({"nome": nome, "preco": int(float(preco))})
-            else:
-                quartos.append({"nome": nome, "preco": "Esgotado"})
+            preco = "Esgotado"
+            preco_el = row.query_selector('.prco-valign-middle-helper')
+            if preco_el:
+                nums = re.findall(r'\d+', preco_el.inner_text().replace('.', '').replace(',', ''))
+                if nums:
+                    preco = int(nums[-1])
             
             nomes_vistos.add(nome.lower())
-            if len(quartos) >= n:
-                break
-        
-        return quartos[:n]
+            quartos.append({"nome": nome, "preco": preco})
     except:
-        return []
+        pass
+    return quartos[:n]
 
 
-# --- FUNÇÃO: Executa varredura por nome (API) ---
 def executar_varredura(datas_para_busca, concorrentes, url_base_busca=None):
     todas_buscas = []
     status = st.empty()
@@ -483,33 +422,30 @@ def executar_varredura(datas_para_busca, concorrentes, url_base_busca=None):
     total = len(datas_para_busca) * len(concorrentes)
     cont = 0
 
-    # Primeiro, busca os IDs de todos os hotéis
-    status.markdown("🔍 Buscando IDs dos hotéis na API do Booking...")
-    hotel_ids = {}
-    for hotel in concorrentes:
-        hid = _buscar_hotel_id_por_nome(hotel)
-        hotel_ids[hotel] = hid
-        if hid:
-            status.markdown(f"✅ {hotel} → ID: {hid}")
-        else:
-            status.markdown(f"⚠️ {hotel} → Não encontrado")
-        time.sleep(0.3)  # rate limit
+    status.markdown("🚀 Iniciando navegador...")
+    with sync_playwright() as p:
+        browser = p.chromium.launch(
+            headless=True,
+            args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu",
+                  "--disable-extensions", "--blink-settings=imagesEnabled=false"]
+        )
+        context = browser.new_context(
+            viewport={"width": 1920, "height": 1080},
+            user_agent="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            locale="pt-BR",
+        )
+        page = context.new_page()
+        page.route("**/*.{png,jpg,jpeg,gif,svg,ico,woff,woff2,ttf,css}", lambda route: route.abort())
 
-    for d_in, d_out in datas_para_busca:
-        for hotel in concorrentes:
-            status.markdown(f"📡 Pesquisando: **{d_in.strftime('%d/%m')}** | {hotel}")
-            hid = hotel_ids.get(hotel)
-            preco_final = "Esgotado"
-            
-            if hid:
-                resultado = _buscar_disponibilidade_api(hid, d_in, d_out)
-                if resultado:
-                    preco_final = resultado["preco"]
-            
-            todas_buscas.append({"Data": d_in.strftime("%d/%m/%Y"), "Hotel": hotel, "Preço": preco_final})
-            cont += 1
-            prog.progress(cont / total)
-            time.sleep(0.2)  # rate limit
+        for d_in, d_out in datas_para_busca:
+            for hotel in concorrentes:
+                status.markdown(f"📡 Pesquisando: **{d_in.strftime('%d/%m')}** | {hotel}")
+                preco_final = _buscar_preco_playwright(page, hotel, d_in, d_out)
+                todas_buscas.append({"Data": d_in.strftime("%d/%m/%Y"), "Hotel": hotel, "Preço": preco_final})
+                cont += 1
+                prog.progress(cont / total)
+
+        browser.close()
 
     status.success("✅ Varredura concluída!")
     df_resultado = pd.DataFrame(todas_buscas)
@@ -525,37 +461,36 @@ def executar_varredura(datas_para_busca, concorrentes, url_base_busca=None):
     return df_resultado
 
 
-# --- FUNÇÃO: Executa varredura por URL direta / slug (API) ---
 def executar_varredura_por_url(datas_para_busca, slugs):
-    """Mantém compatibilidade — busca por nome via API."""
     todas_buscas = []
     status = st.empty()
     prog = st.progress(0)
     total = len(datas_para_busca) * len(slugs)
     cont = 0
 
-    status.markdown("🔍 Buscando IDs dos hotéis na API do Booking...")
-    hotel_ids = {}
-    for nome in slugs.keys():
-        hid = _buscar_hotel_id_por_nome(nome)
-        hotel_ids[nome] = hid
-        time.sleep(0.3)
+    status.markdown("🚀 Iniciando navegador...")
+    with sync_playwright() as p:
+        browser = p.chromium.launch(
+            headless=True,
+            args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"]
+        )
+        context = browser.new_context(
+            viewport={"width": 1920, "height": 1080},
+            user_agent="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            locale="pt-BR",
+        )
+        page = context.new_page()
+        page.route("**/*.{png,jpg,jpeg,gif,svg,ico,woff,woff2,ttf,css}", lambda route: route.abort())
 
-    for d_in, d_out in datas_para_busca:
-        for nome, slug in slugs.items():
-            status.markdown(f"📡 Pesquisando: **{d_in.strftime('%d/%m')}** | {nome}")
-            hid = hotel_ids.get(nome)
-            preco_final = "Esgotado"
-            
-            if hid:
-                resultado = _buscar_disponibilidade_api(hid, d_in, d_out)
-                if resultado:
-                    preco_final = resultado["preco"]
-            
-            todas_buscas.append({"Data": d_in.strftime("%d/%m/%Y"), "Hotel": nome, "Preço": preco_final})
-            cont += 1
-            prog.progress(cont / total)
-            time.sleep(0.2)
+        for d_in, d_out in datas_para_busca:
+            for nome, slug in slugs.items():
+                status.markdown(f"📡 Pesquisando: **{d_in.strftime('%d/%m')}** | {nome}")
+                preco_final = _buscar_preco_playwright(page, nome, d_in, d_out, slug=slug)
+                todas_buscas.append({"Data": d_in.strftime("%d/%m/%Y"), "Hotel": nome, "Preço": preco_final})
+                cont += 1
+                prog.progress(cont / total)
+
+        browser.close()
 
     status.success("✅ Varredura concluída!")
     df_resultado = pd.DataFrame(todas_buscas)
@@ -800,10 +735,19 @@ def _shopper_selecionar_datas(key_prefix):
         st.sidebar.info(f"📋 {len(periodos)} período(s) → {len(datas)} busca(s)\n{resumo}")
         return datas
 # ==============================================================================
-# SHOPPER ALTO DA BOA VISTA — funções especiais (quartos + nome) via API
+# SHOPPER ALTO DA BOA VISTA — Playwright
 # ==============================================================================
 
 def executar_varredura_alto(datas_para_busca, concorrentes, sua_col, slug_alto):
+    SLUGS_CONC = {
+        "Pousada Villa Capivary Campos do Jordão": "pousada-villa-capivary",
+        "Pousada Da Pedra":                        "pousada-da-pedra",
+        "Villa Amistà Campos do Jordão":           "villa-amista-campos-do-jordao",
+        "Pousada Boutique Figueira da Serra":      "pousada-figueira-da-serra",
+        "L.A.H. Hostellerie":                      "l-a-h-hostellerie",
+        "Carballo Hotel & Spa":                    "carballo-amp-spa",
+        "Hotel Boutique QUEBRA-NOZ":               "quebra-noz",
+    }
     status = st.empty()
     prog   = st.progress(0)
     outros = [c for c in concorrentes if c != sua_col]
@@ -811,54 +755,55 @@ def executar_varredura_alto(datas_para_busca, concorrentes, sua_col, slug_alto):
     cont   = 0
     todas  = []
 
-    # Busca IDs de todos os hotéis
-    status.markdown("🔍 Buscando IDs dos hotéis na API do Booking...")
-    hotel_ids = {}
-    for hotel in outros:
-        hid = _buscar_hotel_id_por_nome(hotel)
-        hotel_ids[hotel] = hid
-        time.sleep(0.3)
-    
-    alto_id = _buscar_hotel_id_por_nome(sua_col)
-    time.sleep(0.3)
+    status.markdown("🚀 Iniciando navegador...")
+    with sync_playwright() as p:
+        browser = p.chromium.launch(
+            headless=True,
+            args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu",
+                  "--blink-settings=imagesEnabled=false"]
+        )
+        context = browser.new_context(
+            viewport={"width": 1920, "height": 1080},
+            user_agent="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            locale="pt-BR",
+        )
+        page = context.new_page()
+        page.route("**/*.{png,jpg,jpeg,gif,svg,ico,woff,woff2,ttf,css}", lambda route: route.abort())
 
-    for d_in, d_out in datas_para_busca:
-        label = f"{d_in.strftime('%d/%m/%Y')} → {d_out.strftime('%d/%m/%Y')}"
-        linha = {"Data": label}
+        for d_in, d_out in datas_para_busca:
+            label = f"{d_in.strftime('%d/%m/%Y')} → {d_out.strftime('%d/%m/%Y')}"
+            linha = {"Data": label}
 
-        for hotel in outros:
-            status.markdown(f"📡 **{label}** | {hotel[:35]}...")
-            hid = hotel_ids.get(hotel)
-            preco = "Esgotado"
-            nome_conc = ""
-            
-            if hid:
-                resultado = _buscar_disponibilidade_api(hid, d_in, d_out)
-                if resultado:
-                    preco = resultado["preco"]
-                    nome_conc = resultado.get("quarto", "")
-            
-            linha[hotel] = preco
-            linha[f"{hotel}__quarto"] = nome_conc
+            for hotel in outros:
+                status.markdown(f"📡 **{label}** | {hotel[:35]}...")
+                slug = SLUGS_CONC.get(hotel, "")
+                preco = _buscar_preco_playwright(page, hotel, d_in, d_out, slug=slug if slug else None)
+                nome_conc = ""
+                if slug:
+                    try:
+                        el = page.query_selector('span.hprt-roomtype-icon-link')
+                        if el:
+                            nome_conc = " ".join(el.inner_text().strip().split())
+                    except:
+                        pass
+                linha[hotel] = preco
+                linha[f"{hotel}__quarto"] = nome_conc
+                cont += 1
+                prog.progress(cont / total)
+
+            status.markdown(f"🏨 **{label}** | Alto da Boa Vista — buscando quartos...")
+            quartos = _buscar_quartos_playwright(page, slug_alto, d_in, d_out, n=5)
+            for i, q in enumerate(quartos):
+                linha[f"Alto_Q{i+1}_nome"]  = q["nome"]
+                linha[f"Alto_Q{i+1}_preco"] = q["preco"]
+            for i in range(len(quartos), 5):
+                linha[f"Alto_Q{i+1}_nome"]  = "Esgotado"
+                linha[f"Alto_Q{i+1}_preco"] = "Esgotado"
             cont += 1
             prog.progress(cont / total)
-            time.sleep(0.2)
+            todas.append(linha)
 
-        # Busca quartos do Alto da Boa Vista
-        status.markdown(f"🏨 **{label}** | Alto da Boa Vista — buscando quartos...")
-        quartos = []
-        if alto_id:
-            quartos = _buscar_quartos_api(alto_id, d_in, d_out, n=5)
-        
-        for i, q in enumerate(quartos):
-            linha[f"Alto_Q{i+1}_nome"]  = q["nome"]
-            linha[f"Alto_Q{i+1}_preco"] = q["preco"]
-        for i in range(len(quartos), 5):
-            linha[f"Alto_Q{i+1}_nome"]  = "Esgotado"
-            linha[f"Alto_Q{i+1}_preco"] = "Esgotado"
-        cont += 1
-        prog.progress(cont / total)
-        todas.append(linha)
+        browser.close()
 
     status.success("✅ Varredura concluída!")
     df = pd.DataFrame(todas)
