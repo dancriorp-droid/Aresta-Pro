@@ -7,21 +7,15 @@ try:
     import pyotp
 except:
     pass
-from selenium import webdriver
-from selenium.webdriver.edge.service import Service
-from selenium.webdriver.edge.options import Options
-from selenium.webdriver.chrome.service import Service as ChromeService
-from selenium.webdriver.chrome.options import Options as ChromeOptions
-from selenium.webdriver.common.by import By
-from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.support import expected_conditions as EC
+# Selenium removido — usando requests + BeautifulSoup (mais rápido)
+import requests
+from bs4 import BeautifulSoup
 import pandas as pd
 import os, re, io, calendar, time, base64
 import plotly.express as px
 from datetime import date, timedelta
 from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
-from cloud_driver import criar_driver
 
 
 # ==============================================================================
@@ -83,80 +77,6 @@ def historico_carregar():
 # ==============================================================================
 # WATCHDOG — mata processo se travar mais de 5 minutos
 # ==============================================================================
-
-def _executar_com_watchdog(func, timeout_segundos=300):
-    """
-    Executa uma função com timeout.
-    Se travar por mais de timeout_segundos, cancela e registra o erro.
-    """
-    resultado = {"erro": None, "concluido": False}
-
-    def _wrapper():
-        try:
-            func()
-            resultado["concluido"] = True
-        except Exception as e:
-            resultado["erro"] = str(e)
-
-    thread = threading.Thread(target=_wrapper, daemon=True)
-    thread.start()
-    thread.join(timeout=timeout_segundos)
-
-    if thread.is_alive():
-        _log_aresta(f"WATCHDOG: Função travou após {timeout_segundos}s — cancelando", "ERRO")
-        historico_salvar(
-            funcao="Watchdog",
-            status=f"❌ Processo cancelado por timeout ({timeout_segundos}s)",
-            detalhes={"mensagem": "O robô travou e foi cancelado automaticamente"}
-        )
-        return False, "Processo cancelado por timeout"
-
-    if resultado["erro"]:
-        _log_aresta(f"WATCHDOG: Erro capturado: {resultado['erro']}", "ERRO")
-        return False, resultado["erro"]
-
-    return True, None
-
-
-# ==============================================================================
-# RECONEXÃO AUTOMÁTICA AMANDA
-# ==============================================================================
-
-def _verificar_sessao_amanda(driver, wait, amanda_url, login, senha, status):
-    """
-    Verifica se a sessão do Amanda ainda está ativa.
-    Se expirou, faz login novamente sem reiniciar o browser.
-    """
-    from selenium.webdriver.common.by import By
-    from selenium.webdriver.support import expected_conditions as EC
-    import time
-    try:
-        # Se a URL atual não contém o domínio do Amanda ou voltou para login
-        url_atual = driver.current_url
-        if "login" in url_atual.lower() or amanda_url.split("/")[2] not in url_atual:
-            status.markdown("🔄 Sessão Amanda expirada — reconectando...")
-            _log_aresta("Sessão Amanda expirada — reconectando automaticamente")
-            driver.get(amanda_url)
-            time.sleep(3)
-            try:
-                campo_email = driver.find_element(By.CSS_SELECTOR,
-                    "input[type='email'], input[name='email'], #email")
-                campo_email.clear()
-                campo_email.send_keys(login)
-                campo_senha = driver.find_element(By.CSS_SELECTOR,
-                    "input[type='password']")
-                campo_senha.clear()
-                campo_senha.send_keys(senha)
-                driver.find_element(By.CSS_SELECTOR,
-                    "button[type='submit']").click()
-                time.sleep(4)
-                status.markdown("✅ Reconectado ao Amanda!")
-                _log_aresta("Reconexão Amanda bem-sucedida")
-            except:
-                pass
-    except:
-        pass
-
 # --- 1. CONFIGURAÇÃO DA PÁGINA ---
 st.set_page_config(page_title="Aresta PRO", layout="wide")
 
@@ -328,482 +248,6 @@ aba_selecionada = st.sidebar.selectbox("Selecione a Ferramenta:", [
 ])
 st.sidebar.markdown("---")
 
-def _capturar_2fa_authenticator(status):
-    """Gera o código 2FA automaticamente via pyotp."""
-    try:
-        import pyotp
-        totp = pyotp.TOTP("GY2DSYZZGAZWMYZQGY4Q")
-        codigo = totp.now()
-        status.markdown(f"✅ 2FA gerado: {codigo[:3]} {codigo[3:]}")
-        _log_aresta(f"2FA gerado via pyotp: {codigo[:3]}***")
-        return codigo
-    except Exception as e:
-        status.markdown(f"⚠️ Erro ao gerar 2FA: {e}")
-        _log_aresta(f"ERRO ao gerar 2FA: {e}", "ERRO")
-        return None
-
-
-
-# ==============================================================================
-# FUNÇÃO: Log de execuções — aresta_log.txt
-# ==============================================================================
-
-def _log_aresta(mensagem, nivel="INFO"):
-    """Registra no arquivo aresta_log.txt com data/hora."""
-    try:
-        log_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "aresta_log.txt")
-        linha = f"[{datetime.now().strftime('%d/%m/%Y %H:%M:%S')}] [{nivel}] {mensagem}\n"
-        with open(log_path, "a", encoding="utf-8") as f:
-            f.write(linha)
-    except:
-        pass
-
-
-# ==============================================================================
-# FUNÇÃO: Fechar popups do Omnibees (antes de navegar)
-# ==============================================================================
-
-def _fechar_popups_omnibees(driver, status=None):
-    """
-    Varre a página e fecha qualquer popup/modal que esteja aberto.
-    Chamada após o login E após cada refresh no Omnibees.
-    """
-    from selenium.webdriver.common.by import By
-    import time
-    try:
-        fechou = driver.execute_script("""
-            // Tenta fechar qualquer modal/popup visível
-            var seletores = [
-                'button[aria-label="Close"]',
-                'button[aria-label="Fechar"]',
-                'button.close',
-                '.modal-close',
-                '.btn-close',
-                'lib-icon[name="close"]',
-                'button[class*="close"]',
-                '.modal .close',
-                '.modal-dialog button.close',
-                'div[class*="modal"] button[class*="close"]',
-                'lib-button[text="Fechar"] button',
-                'lib-button[text="OK"] button',
-                'lib-button[text="Não mostrar"] button',
-            ];
-            for (var sel of seletores) {
-                var els = document.querySelectorAll(sel);
-                for (var el of els) {
-                    if (el.offsetParent !== null) {
-                        el.click();
-                        return true;
-                    }
-                }
-            }
-            // Tenta pelo texto do botão
-            var btns = document.querySelectorAll('button, lib-button');
-            for (var btn of btns) {
-                var txt = (btn.innerText || '').trim().toLowerCase();
-                if ((txt === 'fechar' || txt === 'ok' || txt === 'não mostrar' || 
-                     txt === 'close' || txt === 'dismiss') && btn.offsetParent !== null) {
-                    btn.click();
-                    return true;
-                }
-            }
-            return false;
-        """)
-        if fechou:
-            if status:
-                status.markdown("✅ Popup Omnibees fechado!")
-            _log_aresta("Popup Omnibees fechado automaticamente")
-            time.sleep(1)
-    except:
-        pass
-
-
-# ==============================================================================
-# FUNÇÃO: Capturar 2FA com retry automático (trata código expirado)
-# ==============================================================================
-
-def _capturar_2fa_com_retry(status, max_tentativas=3):
-    """
-    Captura o código 2FA com até 3 tentativas.
-    O código expira a cada 30s — se o Omnibees rejeitar, captura novamente.
-    """
-    import time as t_retry
-    for tentativa in range(1, max_tentativas + 1):
-        if tentativa > 1:
-            status.markdown(f"🔄 Tentativa {tentativa} de capturar 2FA...")
-            t_retry.sleep(2)
-        codigo = _capturar_2fa_authenticator(status)
-        if codigo and len(codigo) == 6:
-            _log_aresta(f"2FA capturado na tentativa {tentativa}: {codigo[:3]}***")
-            return codigo
-    _log_aresta("ERRO: Não foi possível capturar 2FA após 3 tentativas", "ERRO")
-    return None
-
-# ==============================================================================
-# FUNÇÕES AUXILIARES OMNIBEES — ESCOPO GLOBAL
-# ==============================================================================
-
-def _login_omnibees(driver, wait, config, codigo_2fa, status):
-    from selenium.webdriver.common.by import By
-    from selenium.webdriver.support import expected_conditions as EC
-    import time
-    status.markdown("🔄 Abrindo Omnibees...")
-    driver.get("https://myhotel2.omnibees.com/#/home")
-    time.sleep(2)
-    driver.refresh()
-    time.sleep(2)
-    try:
-        popup_close = driver.find_element(By.CSS_SELECTOR,
-            "button.close, .modal-close, [aria-label='Close'], [aria-label='Fechar'], "
-            ".btn-close, button[class*='close'], .close-button, lib-icon[name='close']")
-        popup_close.click()
-        time.sleep(2)
-    except:
-        pass
-    try:
-        campo_login = wait.until(EC.presence_of_element_located((By.CSS_SELECTOR,
-            "input[type='text'], input[name='username'], #username")))
-        time.sleep(5)
-        campo_login.clear()
-        campo_login.send_keys(config["login"])
-        time.sleep(0.5)
-        campo_senha = driver.find_element(By.CSS_SELECTOR,
-            "input[type='password'], input[name='password'], #password")
-        campo_senha.clear()
-        campo_senha.send_keys(config["senha"])
-        time.sleep(0.5)
-        driver.find_element(By.CSS_SELECTOR,
-            "button[type='submit'], input[type='submit']").click()
-        status.markdown("🔐 Login realizado, aguardando autenticador...")
-        time.sleep(3)
-    except:
-        status.markdown("🔄 Já logado, continuando...")
-    try:
-        campo_2fa = wait.until(EC.presence_of_element_located((By.CSS_SELECTOR,
-            "input[name='code'], input[placeholder*='código'], "
-            "input[placeholder*='code'], input[maxlength='6']")))
-        campo_2fa.clear()
-        campo_2fa.send_keys(codigo_2fa)
-        time.sleep(0.3)
-        driver.find_element(By.CSS_SELECTOR,
-            "button[type='submit'], input[type='submit']").click()
-        status.markdown("✅ Autenticador validado!")
-        time.sleep(4)
-        driver.refresh()
-        time.sleep(6)
-    except:
-        status.markdown("🔄 2FA não solicitado, continuando...")
-        time.sleep(4)
-    # Aguarda 2s após login e atualiza para fechar popup que pode aparecer
-    status.markdown("🔄 Atualizando página após login...")
-    time.sleep(2)
-    driver.refresh()
-    time.sleep(3)
-    _fechar_popups_omnibees(driver, status)  # Fecha popup se aparecer após refresh
-    status.markdown("📋 Abrindo Tarifários e Disponibilidade...")
-    try:
-        wait.until(EC.element_to_be_clickable((By.XPATH,
-            "//*[contains(text(), 'Tarifários e Disponibilidade')]"))).click()
-        time.sleep(2)
-    except:
-        driver.execute_script("""
-            var els = document.querySelectorAll('*');
-            for (var el of els) {
-                if (el.innerText && el.innerText.trim() === 'Tarifários e Disponibilidade') {
-                    el.click(); break;
-                }
-            }
-        """)
-        time.sleep(2)
-    status.markdown("💰 Abrindo Preços e Disponibilidade...")
-    try:
-        wait.until(EC.element_to_be_clickable((By.XPATH,
-            "//*[contains(text(), 'Preços e Disponibilidade')]"))).click()
-        time.sleep(2)
-    except:
-        driver.execute_script("""
-            var els = document.querySelectorAll('*');
-            for (var el of els) {
-                if (el.innerText && el.innerText.trim() === 'Preços e Disponibilidade'
-                        && el.children.length === 0) {
-                    el.click(); break;
-                }
-            }
-        """)
-        time.sleep(2)
-
-
-def _selecionar_datas(driver, wait, data_ini, data_fim, status):
-    from selenium.webdriver.common.by import By
-    from selenium.webdriver.support import expected_conditions as EC
-    import time
-    status.markdown("📅 Adicionando datas...")
-    wait.until(EC.element_to_be_clickable((By.CSS_SELECTOR,
-        "#btn-updateRates-button-dates-add-new"))).click()
-    time.sleep(0.8)
-    status.markdown("📅 Abrindo calendário...")
-    try:
-        btn_cal = wait.until(EC.presence_of_element_located((By.CSS_SELECTOR,
-            "lib-date-range button")))
-        driver.execute_script("arguments[0].scrollIntoView(true);", btn_cal)
-        time.sleep(0.2)
-        driver.execute_script("arguments[0].click();", btn_cal)
-    except:
-        driver.execute_script(
-            "var btn = document.querySelector('lib-date-range button'); if (btn) btn.click();")
-    time.sleep(0.8)
-
-    def _navegar_mes_calendario(driver, data_alvo, max_cliques=24):
-        """Navega o calendário até o mês/ano correto clicando na seta >"""
-        import time
-        meses_pt = {1:"Janeiro", 2:"Fevereiro", 3:"Março", 4:"Abril", 5:"Maio",
-                    6:"Junho", 7:"Julho", 8:"Agosto", 9:"Setembro",
-                    10:"Outubro", 11:"Novembro", 12:"Dezembro"}
-        mes_alvo = meses_pt[data_alvo.month].strip().lower()
-        ano_alvo = str(data_alvo.year)
-
-        for _ in range(max_cliques):
-            # Lê TODOS os meses visíveis no calendário (pode mostrar 2 meses)
-            meses_visiveis = driver.execute_script("""
-                var resultado = [];
-                var spans = document.querySelectorAll('span.selected-year-month');
-                for (var s of spans) {
-                    var m = s.querySelector('span.month');
-                    var a = s.querySelector('span.year');
-                    if (m && a) {
-                        resultado.push({
-                            mes: m.innerText.trim().toLowerCase(),
-                            ano: a.innerText.trim()
-                        });
-                    }
-                }
-                // Fallback se não encontrar
-                if (resultado.length === 0) {
-                    var m = document.querySelector('span.month');
-                    var a = document.querySelector('span.year');
-                    if (m && a) resultado.push({
-                        mes: m.innerText.trim().toLowerCase(),
-                        ano: a.innerText.trim()
-                    });
-                }
-                return resultado;
-            """)
-
-            # Verifica se o mês alvo está em qualquer um dos meses visíveis
-            for mv in meses_visiveis:
-                if mes_alvo in mv['mes'] and ano_alvo == mv['ano']:
-                    return True
-
-            # Clica na seta > para avançar o mês
-            clicou = driver.execute_script("""
-                var icon = document.querySelector('[data-cy="btn_next-icon_angle-down"]');
-                if (icon) {
-                    var btn = icon.closest('button') || icon.parentElement;
-                    if (btn) { btn.click(); return true; }
-                }
-                return false;
-            """)
-            time.sleep(0.8)
-            if not clicou:
-                break
-        return False
-
-    for dt_omni in [data_ini, data_fim]:
-        # Navega até o mês correto antes de clicar no dia
-        status.markdown(f"📅 Navegando para {dt_omni.strftime('%m/%Y')}...")
-        _navegar_mes_calendario(driver, dt_omni)
-        time.sleep(0.3)
-
-        dia_str_z = str(dt_omni.day).zfill(2)
-        dia_str   = str(dt_omni.day)
-        mes_str_z = str(dt_omni.month).zfill(2)
-        mes_str   = str(dt_omni.month)
-        clicou = False
-        for cy in [
-            f"{dia_str_z}-month_id_-_{mes_str_z}",
-            f"{dia_str}-month_id_-_{mes_str}",
-            f"{dia_str_z}-month_id_-_{mes_str}",
-            f"{dia_str}-month_id_-_{mes_str_z}",
-        ]:
-            try:
-                el = wait.until(EC.element_to_be_clickable((By.CSS_SELECTOR,
-                    f"span[data-cy='{cy}']")))
-                driver.execute_script("arguments[0].click();", el)
-                clicou = True
-                break
-            except:
-                pass
-        if not clicou:
-            driver.execute_script("""
-                var spans = document.querySelectorAll('span[data-cy]');
-                for (var s of spans) {
-                    var cy = s.getAttribute('data-cy') || '';
-                    if (cy.startsWith(arguments[0]) || cy.startsWith(arguments[1])) {
-                        s.click(); break;
-                    }
-                }
-            """, f"{dia_str}-month_id_-_", f"{dia_str_z}-month_id_-_")
-        time.sleep(0.4)
-    time.sleep(0.5)
-    try:
-        ok_btn = driver.find_element(By.CSS_SELECTOR,
-            "div[class*='cdk-overlay-pane'] div[class*='esp-footer'] lib-button:first-child button, "
-            "div[class*='esp-footer'] lib-button:first-child button")
-        driver.execute_script("arguments[0].click();", ok_btn)
-    except:
-        driver.execute_script("""
-            var btns = document.querySelectorAll('lib-button button, button');
-            for (var b of btns) {
-                var txt = (b.innerText || '').trim().toUpperCase();
-                if (txt === 'OK' || txt === 'CONFIRMAR' || txt === 'APLICAR') { b.click(); break; }
-            }
-        """)
-    time.sleep(0.8)
-
-
-def _clicar_checkbox_texto(driver, texto):
-    driver.execute_script("""
-        (function(texto) {
-            var walker = document.createTreeWalker(
-                document.body, NodeFilter.SHOW_TEXT, null, false);
-            var node;
-            while (node = walker.nextNode()) {
-                if (node.textContent.trim() === texto) {
-                    var parent = node.parentElement;
-                    for (var i = 0; i < 8; i++) {
-                        if (!parent) break;
-                        var chk = parent.querySelector('input[type="checkbox"]');
-                        if (chk) {
-                            chk.scrollIntoView({block: 'center'});
-                            chk.click();
-                            return;
-                        }
-                        parent = parent.parentElement;
-                    }
-                }
-            }
-        })(arguments[0]);
-    """, texto)
-    import time
-    time.sleep(0.4)
-
-
-TARIFARIOS_DATA_CY = {
-    "Trf Bancorbras":                  "update_treeview-union_rates_package_tree-item_click_-_Trf Bancorbras",
-    "CLUBE MONTREAL":                  "update_treeview-union_rates_package_tree-item_click_-_CLUBE MONTREAL",
-    "Tarifa Flexível":                 "update_treeview-union_rates_package_tree-item_click_-_Tarifa Flexivel",
-    "Condição Exclusiva":              "update_treeview-union_rates_package_tree-item_click_-_Condição Exclusiva",
-    "Programa Preferencial - Orinter": "update_treeview-union_rates_package_tree-item_click_-_Programa Preferencial - Orinter",
-    "Tarifa Não Reembolsável.":        "update_treeview-union_rates_package_tree-item_click_-_Tarifa Não Reembolsável.",
-    "Tarifa Site":                     "update_treeview-union_rates_package_tree-item_click_-_Tarifa Site",
-}
-SELECIONAR_TODOS_CY = "update_treeview-union_rates_package_tree-select_all_checkbox-"
-
-
-def _selecionar_tarifarios(driver, wait, sel_todos, tarifarios_sel, status):
-    from selenium.webdriver.common.by import By
-    from selenium.webdriver.support import expected_conditions as EC
-    import time
-    status.markdown("🏷️ Abrindo painel de tarifários...")
-    wait.until(EC.element_to_be_clickable((By.CSS_SELECTOR,
-        "body > ob-root > div > ob-layout > div > div > div > div > ob-rate-availability "
-        "> div.h-100 > lib-frame > div.frm-inside > div.wrapper.overflow-auto > div.row "
-        "> div:nth-child(2) > div > div.button-area"))).click()
-    wait.until(EC.presence_of_element_located((By.CSS_SELECTOR,
-        "#updateRates-button-rate-packages-sidepanel-save")))
-    time.sleep(1.5)
-
-    def _clicar_por_data_cy(cy):
-        el = wait.until(EC.element_to_be_clickable((By.CSS_SELECTOR,
-            f'input[data-cy="{cy}"]')))
-        driver.execute_script("arguments[0].scrollIntoView({block:'center'});", el)
-        time.sleep(0.2)
-        driver.execute_script("arguments[0].click();", el)
-        time.sleep(0.4)
-
-    if sel_todos:
-        status.markdown("🏷️ Selecionando todos os tarifários...")
-        # Clica no checkbox "Selecionar Todos os Tarifários e Pacotes" via TreeWalker
-        _clicar_checkbox_texto(driver, "Selecionar Todos os Tarifários e Pacotes")
-        time.sleep(0.5)
-    else:
-        for tar in tarifarios_sel:
-            status.markdown(f"🏷️ Selecionando: {tar}")
-            cy = TARIFARIOS_DATA_CY.get(tar)
-            if cy:
-                try:
-                    # Clica no div.tree-item pelo data-cy (elemento clicável do Angular)
-                    el = wait.until(EC.presence_of_element_located((By.CSS_SELECTOR,
-                        f'div[data-cy="{cy}"]')))
-                    driver.execute_script("arguments[0].scrollIntoView({block:'center'});", el)
-                    time.sleep(0.3)
-                    inner = el.find_element(By.CSS_SELECTOR, "div[clicktype='1']")
-                    driver.execute_script("arguments[0].click();", inner)
-                except:
-                    # Fallback: TreeWalker pelo texto
-                    _clicar_checkbox_texto(driver, tar)
-            else:
-                _clicar_checkbox_texto(driver, tar)
-            time.sleep(0.5)
-
-    wait.until(EC.element_to_be_clickable((By.CSS_SELECTOR,
-        "#updateRates-button-rate-packages-sidepanel-save"))).click()
-    time.sleep(1)
-
-
-def _selecionar_quartos(driver, wait, sel_todos, quartos_sel, status):
-    from selenium.webdriver.common.by import By
-    from selenium.webdriver.support import expected_conditions as EC
-    import time
-    status.markdown("\U0001f6cf\ufe0f Selecionando quartos...")
-    wait.until(EC.element_to_be_clickable((By.CSS_SELECTOR,
-        "body > ob-root > div > ob-layout > div > div > div > div > ob-rate-availability "
-        "> div.h-100 > lib-frame > div.frm-inside > div.wrapper.overflow-auto > div.row "
-        "> div:nth-child(3) > div > div.button-area"))).click()
-    # Aguarda painel carregar
-    wait.until(EC.presence_of_element_located((By.CSS_SELECTOR,
-        'input[data-cy="room_type_list-select_all_chk-"]')))
-    time.sleep(1)
-
-    chk_todos = driver.find_element(By.CSS_SELECTOR,
-        'input[data-cy="room_type_list-select_all_chk-"]')
-
-    if sel_todos:
-        # Marca "Selecionar Todos" se ainda não estiver marcado
-        if not chk_todos.is_selected():
-            driver.execute_script("arguments[0].click();", chk_todos)
-        time.sleep(0.5)
-    else:
-        # 1. Garante que NADA está marcado — desmarca tudo
-        if chk_todos.is_selected():
-            driver.execute_script("arguments[0].click();", chk_todos)  # desmarca
-            time.sleep(0.5)
-        # Se não estava marcado, verifica se tem algum item marcado individualmente
-        # Clica duas vezes para garantir estado limpo
-        driver.execute_script("arguments[0].click();", chk_todos)  # marca todos
-        time.sleep(0.3)
-        driver.execute_script("arguments[0].click();", chk_todos)  # desmarca todos
-        time.sleep(0.5)
-
-        # 2. Seleciona cada quarto pelo div com data-cy exato
-        for qrt in quartos_sel:
-            status.markdown(f"\U0001f6cf\ufe0f Selecionando: {qrt}")
-            try:
-                el = wait.until(EC.element_to_be_clickable((By.CSS_SELECTOR,
-                    f'div[data-cy="update_rate_availability-room_types_sidepanel-checkbox_-_{qrt}"]'
-                )))
-                driver.execute_script("arguments[0].scrollIntoView({block:'center'});", el)
-                time.sleep(0.2)
-                driver.execute_script("arguments[0].click();", el)
-            except:
-                _clicar_checkbox_texto(driver, qrt)
-            time.sleep(0.4)
-
-    wait.until(EC.element_to_be_clickable((By.CSS_SELECTOR,
-        "#updateRates-button-rate-packages-sidepanel-save"))).click()
-    time.sleep(0.5)
-
-
 def gerar_excel_formatado(tabela_final, sua_col, sheet_name='Monitoramento'):
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine='openpyxl') as writer:
@@ -883,11 +327,118 @@ def gerar_excel_formatado(tabela_final, sua_col, sheet_name='Monitoramento'):
     output.seek(0)
     return output
 
-# --- FUNÇÃO: Executa varredura com Edge (por nome) ---
+
+# ==============================================================================
+# FUNÇÕES DE BUSCA — via requests (sem Selenium, muito mais rápido)
+# ==============================================================================
+import concurrent.futures
+
+HEADERS_BOOKING = {
+    "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Accept-Language": "pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Encoding": "gzip, deflate, br",
+    "Referer": "https://www.booking.com/",
+    "DNT": "1",
+}
+
+def _buscar_preco_booking_requests(hotel_nome, d_in, d_out, slug=None):
+    """
+    Busca preço de um hotel no Booking.com via requests + BeautifulSoup.
+    Retorna o preço (int) ou "Esgotado".
+    """
+    try:
+        session = requests.Session()
+        session.headers.update(HEADERS_BOOKING)
+        
+        if slug:
+            url = (f"https://www.booking.com/hotel/br/{slug}.pt-br.html"
+                   f"?checkin={d_in.isoformat()}&checkout={d_out.isoformat()}"
+                   f"&group_adults=2&no_rooms=1&selected_currency=BRL")
+        else:
+            url = (f"https://www.booking.com/searchresults.pt-br.html"
+                   f"?ss={hotel_nome.replace(' ', '+')}"
+                   f"&checkin={d_in.isoformat()}&checkout={d_out.isoformat()}"
+                   f"&group_adults=2&no_rooms=1&selected_currency=BRL&lang=pt-br")
+        
+        resp = session.get(url, timeout=15)
+        resp.raise_for_status()
+        soup = BeautifulSoup(resp.text, "html.parser")
+        
+        # Tenta encontrar preço em páginas de hotel direto
+        if slug:
+            # Busca na tabela de quartos
+            precos = []
+            for el in soup.select('[data-testid="price-and-discounted-price"], .prco-valign-middle-helper, [class*="priceValue"]'):
+                nums = re.findall(r'\d+', el.get_text().replace('.', '').replace(',', ''))
+                if nums:
+                    precos.append(int(nums[-1]))
+            if precos:
+                return min(precos)  # menor preço
+        
+        # Busca em resultados de pesquisa
+        for el in soup.select('[data-testid="price-and-discounted-price"], .prco-valign-middle-helper, [class*="price"]'):
+            texto = el.get_text()
+            nums = re.findall(r'\d+', texto.replace('.', '').replace(',', ''))
+            if nums:
+                val = int(nums[-1])
+                if val > 50:  # ignora valores muito baixos (notas, etc)
+                    return val
+        
+        return "Esgotado"
+    except Exception as e:
+        return "Esgotado"
+
+
+def _buscar_quartos_booking_requests(slug, d_in, d_out, n=5):
+    """
+    Busca quartos e preços de um hotel específico via requests.
+    Retorna lista de dicts: [{"nome": str, "preco": int|str}]
+    """
+    try:
+        session = requests.Session()
+        session.headers.update(HEADERS_BOOKING)
+        
+        url = (f"https://www.booking.com/hotel/br/{slug}.pt-br.html"
+               f"?checkin={d_in.isoformat()}&checkout={d_out.isoformat()}"
+               f"&group_adults=2&no_rooms=1&selected_currency=BRL&lang=pt-br")
+        
+        resp = session.get(url, timeout=15)
+        resp.raise_for_status()
+        soup = BeautifulSoup(resp.text, "html.parser")
+        
+        quartos = []
+        nomes_vistos = set()
+        
+        # Tenta pegar da tabela de quartos
+        for row in soup.select("tr.js-rt-block-row, [data-testid='property-card']"):
+            nome_el = row.select_one("span.hprt-roomtype-icon-link, a.hprt-roomtype-link, [data-testid='title']")
+            if not nome_el:
+                continue
+            nome = " ".join(nome_el.get_text().strip().split())
+            if not nome or nome.lower() in nomes_vistos:
+                continue
+            
+            preco = "Esgotado"
+            for price_el in row.select(".prco-valign-middle-helper, [data-testid='price-and-discounted-price'], [class*='priceValue']"):
+                nums = re.findall(r'\d+', price_el.get_text().replace('.', '').replace(',', ''))
+                if nums:
+                    preco = int(nums[-1])
+                    break
+            
+            nomes_vistos.add(nome.lower())
+            quartos.append({"nome": nome, "preco": preco})
+            if len(quartos) >= n:
+                break
+        
+        return quartos[:n]
+    except:
+        return []
+
+
+# --- FUNÇÃO: Executa varredura por nome (requests) ---
 def executar_varredura(datas_para_busca, concorrentes, url_base_busca=None):
     todas_buscas = []
-    driver = criar_driver()
-    wait = WebDriverWait(driver, 8)
     status = st.empty()
     prog = st.progress(0)
     total = len(datas_para_busca) * len(concorrentes)
@@ -896,23 +447,11 @@ def executar_varredura(datas_para_busca, concorrentes, url_base_busca=None):
     for d_in, d_out in datas_para_busca:
         for hotel in concorrentes:
             status.markdown(f"📡 Pesquisando: **{d_in.strftime('%d/%m')}** | {hotel}")
-            url = (f"https://www.booking.com/searchresults.pt-br.html?ss={hotel.replace(' ', '+')}"
-                   f"&checkin={d_in.isoformat()}&checkout={d_out.isoformat()}"
-                   f"&group_adults=2&no_rooms=1&selected_currency=BRL&lang=pt-br")
-            driver.get(url)
-            try:
-                wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, '[data-testid="property-card"]')))
-                card = driver.find_element(By.CSS_SELECTOR, '[data-testid="property-card"]')
-                preco_elem = card.find_element(By.CSS_SELECTOR, '[data-testid="price-and-discounted-price"]')
-                valor = re.findall(r'\d+', preco_elem.text.replace('.', '').replace(',', ''))
-                preco_final = int(valor[-1]) if valor else "Esgotado"
-            except:
-                preco_final = "Esgotado"
+            preco_final = _buscar_preco_booking_requests(hotel, d_in, d_out)
             todas_buscas.append({"Data": d_in.strftime("%d/%m/%Y"), "Hotel": hotel, "Preço": preco_final})
             cont += 1
             prog.progress(cont / total)
 
-    driver.quit()
     status.success("✅ Varredura concluída!")
     df_resultado = pd.DataFrame(todas_buscas)
     historico_salvar(
@@ -926,15 +465,10 @@ def executar_varredura(datas_para_busca, concorrentes, url_base_busca=None):
     )
     return df_resultado
 
-# --- FUNÇÃO: Executa varredura por URL direta (slug do Booking) ---
+
+# --- FUNÇÃO: Executa varredura por URL direta / slug (requests) ---
 def executar_varredura_por_url(datas_para_busca, slugs):
-    """
-    slugs = dicionário {nome_hotel: slug_booking}
-    Ex: {"Serra Negra Pousada Spa": "serra-negra-pousada-spa"}
-    """
     todas_buscas = []
-    driver = criar_driver()
-    wait = WebDriverWait(driver, 8)
     status = st.empty()
     prog = st.progress(0)
     total = len(datas_para_busca) * len(slugs)
@@ -943,24 +477,11 @@ def executar_varredura_por_url(datas_para_busca, slugs):
     for d_in, d_out in datas_para_busca:
         for nome, slug in slugs.items():
             status.markdown(f"📡 Pesquisando: **{d_in.strftime('%d/%m')}** | {nome}")
-            url = (f"https://www.booking.com/hotel/br/{slug}.pt-br.html"
-                   f"?checkin={d_in.isoformat()}&checkout={d_out.isoformat()}"
-                   f"&group_adults=2&no_rooms=1&selected_currency=BRL")
-            driver.get(url)
-            try:
-                wait.until(EC.presence_of_element_located((By.CSS_SELECTOR,
-                    '[data-testid="price-and-discounted-price"], .hprt-price-price, [class*="priceValue"]')))
-                preco_elem = driver.find_element(By.CSS_SELECTOR,
-                    '[data-testid="price-and-discounted-price"], .hprt-price-price, [class*="priceValue"]')
-                valor = re.findall(r'\d+', preco_elem.text.replace('.', '').replace(',', ''))
-                preco_final = int(valor[-1]) if valor else "Esgotado"
-            except:
-                preco_final = "Esgotado"
+            preco_final = _buscar_preco_booking_requests(nome, d_in, d_out, slug=slug)
             todas_buscas.append({"Data": d_in.strftime("%d/%m/%Y"), "Hotel": nome, "Preço": preco_final})
             cont += 1
             prog.progress(cont / total)
 
-    driver.quit()
     status.success("✅ Varredura concluída!")
     df_resultado = pd.DataFrame(todas_buscas)
     historico_salvar(
@@ -1206,54 +727,12 @@ def _shopper_selecionar_datas(key_prefix):
 # ==============================================================================
 # SHOPPER ALTO DA BOA VISTA — funções especiais (quartos + nome)
 # ==============================================================================
-def _buscar_quartos_hotel_booking(driver, wait, url_hotel, n=5):
-    import time as _t
-    quartos = []
-    nomes_vistos = set()
-    precos_vistos = set()
-    try:
-        driver.get(url_hotel)
-        wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, 'tr.js-rt-block-row')))
-        _t.sleep(2)
-        for linha in driver.find_elements(By.CSS_SELECTOR, 'tr.js-rt-block-row'):
-            if len(quartos) >= n:
-                break
-            nome = ""
-            try:
-                nome = " ".join(linha.find_element(By.CSS_SELECTOR,
-                    'span.hprt-roomtype-icon-link').text.strip().split())
-            except:
-                continue
-            if not nome or nome.lower() in nomes_vistos:
-                continue
-            preco = "Esgotado"
-            try:
-                el = linha.find_element(By.CSS_SELECTOR,
-                    'div.bui-price-display__value span.prco-valign-middle-helper')
-                nums = re.findall(r'\d+', el.text.strip().replace('.', '').replace(',', ''))
-                if nums:
-                    preco = int(nums[-1])
-            except:
-                try:
-                    opt = linha.find_element(By.CSS_SELECTOR,
-                        'select.hprt-nos-select option[value="1"]')
-                    nums = re.findall(r'\d+', opt.text.replace('.', '').replace(',', ''))
-                    if nums:
-                        preco = int(nums[-1])
-                except:
-                    pass
-            if isinstance(preco, int) and preco in precos_vistos:
-                continue
-            nomes_vistos.add(nome.lower())
-            if isinstance(preco, int):
-                precos_vistos.add(preco)
-            quartos.append({"nome": nome, "preco": preco})
-    except:
-        pass
-    return quartos[:n]
+
+# ==============================================================================
+# SHOPPER ALTO DA BOA VISTA — funções especiais (quartos + nome) via requests
+# ==============================================================================
 
 def executar_varredura_alto(datas_para_busca, concorrentes, sua_col, slug_alto):
-    import time as _t
     SLUGS_CONC = {
         "Pousada Villa Capivary Campos do Jordão": "pousada-villa-capivary",
         "Pousada Da Pedra":                        "pousada-da-pedra",
@@ -1263,72 +742,29 @@ def executar_varredura_alto(datas_para_busca, concorrentes, sua_col, slug_alto):
         "Carballo Hotel & Spa":                    "carballo-amp-spa",
         "Hotel Boutique QUEBRA-NOZ":               "quebra-noz",
     }
-    driver = criar_driver()
-    wait   = WebDriverWait(driver, 12)
     status = st.empty()
     prog   = st.progress(0)
     outros = [c for c in concorrentes if c != sua_col]
     total  = len(datas_para_busca) * (len(outros) + 1)
     cont   = 0
     todas  = []
+    
     for d_in, d_out in datas_para_busca:
         label = f"{d_in.strftime('%d/%m/%Y')} → {d_out.strftime('%d/%m/%Y')}"
         linha = {"Data": label}
+        
         for hotel in outros:
             status.markdown(f"📡 **{label}** | {hotel[:35]}...")
             slug = SLUGS_CONC.get(hotel, "")
-            url  = (f"https://www.booking.com/hotel/br/{slug}.pt-br.html"
-                    f"?checkin={d_in.isoformat()}&checkout={d_out.isoformat()}"
-                    f"&group_adults=2&no_rooms=1&selected_currency=BRL") if slug else (
-                   f"https://www.booking.com/searchresults.pt-br.html"
-                   f"?ss={hotel.replace(' ', '+')}"
-                   f"&checkin={d_in.isoformat()}&checkout={d_out.isoformat()}"
-                   f"&group_adults=2&no_rooms=1&selected_currency=BRL&lang=pt-br")
-            driver.get(url)
-            preco = "Esgotado"
-            nome_conc = ""
-            try:
-                if slug:
-                    wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, 'tr.js-rt-block-row')))
-                    melhor = None
-                    for lc in driver.find_elements(By.CSS_SELECTOR, 'tr.js-rt-block-row'):
-                        try:
-                            pe = lc.find_element(By.CSS_SELECTOR,
-                                'div.bui-price-display__value span.prco-valign-middle-helper')
-                            nums = re.findall(r'\d+', pe.text.strip().replace('.','').replace(',',''))
-                            if nums:
-                                v = int(nums[-1])
-                                if melhor is None or v < melhor:
-                                    melhor = v
-                                    try:
-                                        nome_conc = " ".join(lc.find_element(By.CSS_SELECTOR,
-                                            'span.hprt-roomtype-icon-link').text.strip().split())
-                                    except:
-                                        pass
-                        except:
-                            pass
-                    if melhor:
-                        preco = melhor
-                else:
-                    wait.until(EC.presence_of_element_located(
-                        (By.CSS_SELECTOR, '[data-testid="property-card"]')))
-                    card = driver.find_element(By.CSS_SELECTOR, '[data-testid="property-card"]')
-                    pe   = card.find_element(By.CSS_SELECTOR,
-                        '[data-testid="price-and-discounted-price"]')
-                    nums = re.findall(r'\d+', pe.text.replace('.','').replace(',',''))
-                    if nums:
-                        preco = int(nums[-1])
-            except:
-                pass
+            preco = _buscar_preco_booking_requests(hotel, d_in, d_out, slug=slug if slug else None)
             linha[hotel] = preco
-            linha[f"{hotel}__quarto"] = nome_conc
+            linha[f"{hotel}__quarto"] = ""  # requests não pega nome do quarto dos concorrentes
             cont += 1
             prog.progress(cont / total)
-        status.markdown(f"🏨 **{label}** | Alto da Boa Vista — buscando 5 quartos...")
-        url_alto = (f"https://www.booking.com/hotel/br/{slug_alto}.pt-br.html"
-                    f"?checkin={d_in.isoformat()}&checkout={d_out.isoformat()}"
-                    f"&group_adults=2&no_rooms=1&selected_currency=BRL&lang=pt-br")
-        quartos = _buscar_quartos_hotel_booking(driver, wait, url_alto, n=5)
+        
+        # Busca quartos do Alto da Boa Vista
+        status.markdown(f"🏨 **{label}** | Alto da Boa Vista — buscando quartos...")
+        quartos = _buscar_quartos_booking_requests(slug_alto, d_in, d_out, n=5)
         for i, q in enumerate(quartos):
             linha[f"Alto_Q{i+1}_nome"]  = q["nome"]
             linha[f"Alto_Q{i+1}_preco"] = q["preco"]
@@ -1338,7 +774,7 @@ def executar_varredura_alto(datas_para_busca, concorrentes, sua_col, slug_alto):
         cont += 1
         prog.progress(cont / total)
         todas.append(linha)
-    driver.quit()
+    
     status.success("✅ Varredura concluída!")
     df = pd.DataFrame(todas)
     historico_salvar(funcao="Shopper Alto da Boa Vista",
