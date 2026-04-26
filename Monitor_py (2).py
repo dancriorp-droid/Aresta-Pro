@@ -330,7 +330,7 @@ def gerar_excel_formatado(tabela_final, sua_col, sheet_name='Monitoramento'):
 # FUNÇÕES DE BUSCA — via Booking.com Demand API (rápido e confiável)
 # ==============================================================================
 
-BOOKING_API_KEY = "fd3e7724-043d-4b2b-bd73-6bc05b012b02"
+BOOKING_API_KEY = "a4c0977d-5ddb-46ea-97b2-2b0e1c3e7a75"
 BOOKING_AFFILIATE_ID = "2871199"
 BOOKING_API_BASE = "https://demandapi.booking.com/3.1"
 
