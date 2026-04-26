@@ -1,10 +1,1 @@
-chromium
-chromium-driver
-libglib2.0-0t64
-libnss3
-libfontconfig1
-libxss1
-libasound2t64
-libatk-bridge2.0-0
-libgtk-3-0
-libx11-xcb1
+
